@@ -1,0 +1,80 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+import pandas as pd
+import numpy as np
+import joblib
+import requests
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+import os
+
+app = FastAPI()
+
+MODEL_PATH = "cyclone_model.joblib"
+SCALER_PATH = "cyclone_scaler.joblib"
+
+def train_model(csv_path):
+    df = pd.read_csv("C:\Woxsen University\SEMESTER 4\CSP2\project\Historical_Tropical_Storm_Tracks.csv")
+    df['IS_SEVERE'] = df['CAT'].apply(lambda x: 1 if x in ['H3', 'H4', 'H5', 'SS'] else 0)
+    features = ['LAT', 'LONG', 'WIND_KTS', 'PRESSURE', 'MONTH']
+    X = df[features]
+    y = df['IS_SEVERE']
+    X = X.fillna(X.median())
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+    model.fit(X_train_scaled, y_train)
+    y_pred = model.predict(X_test_scaled)
+    metrics = {
+        'accuracy': accuracy_score(y_test, y_pred),
+        'precision': precision_score(y_test, y_pred),
+        'recall': recall_score(y_test, y_pred),
+        'f1_score': f1_score(y_test, y_pred),
+        'roc_auc': roc_auc_score(y_test, y_pred)
+    }
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    return metrics
+
+def fetch_realtime_data():
+    api_key = "YOUR_VISUAL_CROSSING_API_KEY"
+    lat, lon = 17.6868, 83.2185
+    api_url = f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/{lat},{lon}?unitGroup=metric&key={api_key}&contentType=json"
+    response = requests.get(api_url, timeout=10)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Error fetching weather data")
+    data = response.json().get('currentConditions', {})
+    return {
+        'LAT': lat,
+        'LONG': lon,
+        'WIND_KTS': data.get('windspeed', np.nan) * 0.539957,
+        'PRESSURE': data.get('pressure', np.nan),
+        'MONTH': pd.Timestamp.now().month
+    }
+
+def predict(input_data):
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    df = pd.DataFrame([input_data])
+    input_scaled = scaler.transform(df)
+    probability = model.predict_proba(input_scaled)[0, 1]
+    risk_level = 'High' if probability >= 0.7 else 'Moderate' if probability >= 0.4 else 'Low'
+    return {'cyclone_probability': float(probability), 'risk_level': risk_level}
+
+@app.post("/upload-csv/")
+def upload_csv(file: UploadFile = File(...)):
+    file_location = f"uploaded_{file.filename}"
+    with open(file_location, "wb") as f:
+        f.write(file.file.read())
+    metrics = train_model(file_location)
+    os.remove(file_location)
+    return {"message": "Model trained successfully", "metrics": metrics}
+
+@app.get("/predict/")
+def get_prediction():
+    realtime_data = fetch_realtime_data()
+    prediction = predict(realtime_data)
+    return {"message": "Real-time cyclone prediction", "data": prediction}
